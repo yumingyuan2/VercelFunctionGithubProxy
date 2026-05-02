@@ -105,12 +105,6 @@ export default async function handler(req, res) {
       res.setHeader('Access-Control-Max-Age', '86400');
       return res.status(200).end();
     }
-    
-    // 检查特殊路径重定向
-    if (redirect_paths.includes(url.pathname)) {
-      res.setHeader('Location', 'https://www.gov.cn');
-      return res.status(302).end();
-    }
 
     // 从有效主机名中提取前缀
     const host_prefix = getProxyPrefix(effective_host);
