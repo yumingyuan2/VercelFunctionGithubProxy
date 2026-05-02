@@ -27,57 +27,46 @@ const redirect_paths = ['/'];
 
 // 获取当前主机名的前缀，用于匹配反向映射
 function getProxyPrefix(host) {
-  // 检查主机名是否以 gh. 开头
   if (host.startsWith('gh.')) {
     return 'gh.';
   }
-  
-  // 检查其他映射前缀
   for (const prefix of Object.values(domain_mappings)) {
     if (host.startsWith(prefix)) {
       return prefix;
     }
   }
-  
   return null;
 }
 
 // 修改响应内容
 async function modifyResponse(response, host_prefix, effective_hostname) {
-  // 只处理文本内容
   const content_type = response.headers.get('content-type') || '';
-  if (!content_type.includes('text/') && 
-      !content_type.includes('application/json') && 
-      !content_type.includes('application/javascript') && 
+  if (!content_type.includes('text/') &&
+      !content_type.includes('application/json') &&
+      !content_type.includes('application/javascript') &&
       !content_type.includes('application/xml')) {
-    // 对于非文本内容，直接返回原始数据
     return response.body;
   }
 
   let text = await response.text();
-  
-  // 使用有效主机名获取域名后缀部分（用于构建完整的代理域名）
   const domain_suffix = effective_hostname.substring(host_prefix.length);
-  
+
   // 替换所有域名引用
   for (const [original_domain, proxy_prefix] of Object.entries(domain_mappings)) {
     const escaped_domain = original_domain.replace(/\./g, '\\.');
     const full_proxy_domain = `${proxy_prefix}${domain_suffix}`;
     
-    // 替换完整URLs
     text = text.replace(
       new RegExp(`https?://${escaped_domain}(?=/|"|'|\\s|$)`, 'g'),
       `https://${full_proxy_domain}`
     );
-    
-    // 替换协议相对URLs
     text = text.replace(
       new RegExp(`//${escaped_domain}(?=/|"|'|\\s|$)`, 'g'),
       `//${full_proxy_domain}`
     );
   }
 
-  // 处理相对路径
+  // 处理相对路径（仅限于 gh. 前缀的通用 GitHub 代理）
   if (host_prefix === 'gh.') {
     text = text.replace(
       /(?<=["'])\/(?!\/|[a-zA-Z]+:)/g,
@@ -93,10 +82,8 @@ export default async function handler(req, res) {
   try {
     const url = new URL(req.url, `https://${req.headers.host}`);
     const current_host = req.headers.host || url.host;
-    
-    // 检测Host头，优先使用Host头中的域名来决定后缀
     const effective_host = req.headers.host || current_host;
-    
+
     // 处理 OPTIONS 请求（CORS 预检）
     if (req.method === 'OPTIONS') {
       res.setHeader('Access-Control-Allow-Origin', '*');
@@ -125,10 +112,8 @@ export default async function handler(req, res) {
       return res.status(404).send('Domain not configured for proxy');
     }
 
-    // 直接使用正则表达式处理最常见的嵌套URL问题
+    // 处理路径，修复可能的嵌套 URL
     let pathname = url.pathname;
-    
-    // 修复特定的嵌套URL模式 - 直接移除嵌套URL部分
     pathname = pathname.replace(/(\/[^\/]+\/[^\/]+\/(?:latest-commit|tree-commit-info)\/[^\/]+)\/https%3A\/\/[^\/]+\/.*/, '$1');
     pathname = pathname.replace(/(\/[^\/]+\/[^\/]+\/(?:latest-commit|tree-commit-info)\/[^\/]+)\/https:\/\/[^\/]+\/.*/, '$1');
 
@@ -137,8 +122,6 @@ export default async function handler(req, res) {
 
     // 设置新的请求头
     const new_headers = new Headers();
-    
-    // 复制原始请求头，但过滤掉一些特定的头
     const headers_to_skip = ['host', 'connection', 'cf-', 'x-forwarded-', 'x-vercel-'];
     for (const [key, value] of Object.entries(req.headers)) {
       const lower_key = key.toLowerCase();
@@ -146,15 +129,14 @@ export default async function handler(req, res) {
         new_headers.set(key, value);
       }
     }
-    
     new_headers.set('Host', target_host);
     new_headers.set('Referer', new_url.href);
-    
+
     // 准备请求选项
     const fetchOptions = {
       method: req.method,
       headers: new_headers,
-      redirect: 'manual'  // 手动处理重定向
+      redirect: 'manual'
     };
 
     // 处理请求体
@@ -175,7 +157,6 @@ export default async function handler(req, res) {
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       const location = response.headers.get('location');
       if (location) {
-        // 修改重定向URL以使用代理域名
         let new_location = location;
         for (const [original_domain, proxy_prefix] of Object.entries(domain_mappings)) {
           if (location.includes(original_domain)) {
@@ -190,14 +171,12 @@ export default async function handler(req, res) {
       }
     }
 
-    // 设置响应头
-    const response_headers = {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Credentials': 'true',
-      'Cache-Control': 'public, max-age=14400'
-    };
+    // ===== 核心修改：处理响应头，尤其是 Set-Cookie =====
+    // 先设置几个通用的响应头
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Cache-Control', 'public, max-age=14400');
 
-    // 复制原始响应头，但过滤掉一些特定的头
     const response_headers_to_skip = [
       'content-encoding',
       'content-length',
@@ -208,39 +187,58 @@ export default async function handler(req, res) {
       'transfer-encoding'
     ];
 
+    const setCookieHeaders = [];
+
     response.headers.forEach((value, key) => {
       const lower_key = key.toLowerCase();
-      if (!response_headers_to_skip.includes(lower_key)) {
-        response_headers[key] = value;
+
+      // 跳过不需要的响应头
+      if (response_headers_to_skip.includes(lower_key)) {
+        return;
+      }
+
+      // 单独处理 Set-Cookie
+      if (lower_key === 'set-cookie') {
+        let cookie = value;
+        // 替换 domain 为当前的代理域名
+        cookie = cookie.replace(
+          /domain=\.?github\.com(;|$)/gi,
+          `domain=${effective_host}$1`
+        );
+        // 如果代理环境不是 HTTPS，需要去掉 Secure 标记，否则浏览器会拒绝
+        // 下面这行可以根据实际情况启用（取消注释即可）
+        // cookie = cookie.replace(/;\s*secure\b/gi, '');
+        setCookieHeaders.push(cookie);
+      } else {
+        // 其他响应头直接设置
+        res.setHeader(key, value);
       }
     });
 
-    // 设置所有响应头
-    Object.entries(response_headers).forEach(([key, value]) => {
-      res.setHeader(key, value);
-    });
+    // 设置所有修改后的 Set-Cookie 头（Node.js 支持数组形式的 Set-Cookie）
+    if (setCookieHeaders.length > 0) {
+      res.setHeader('Set-Cookie', setCookieHeaders);
+    }
 
     // 设置状态码
     res.status(response.status);
 
     // 处理响应内容
     const content_type = response.headers.get('content-type') || '';
-    if (content_type.includes('text/') || 
-        content_type.includes('application/json') || 
-        content_type.includes('application/javascript') || 
+    if (content_type.includes('text/') ||
+        content_type.includes('application/json') ||
+        content_type.includes('application/javascript') ||
         content_type.includes('application/xml')) {
-      // 文本内容需要修改
       const modified_body = await modifyResponse(response.clone(), host_prefix, effective_host);
       res.send(modified_body);
     } else {
-      // 二进制内容直接传输
       const buffer = await response.arrayBuffer();
       res.send(Buffer.from(buffer));
     }
   } catch (error) {
     console.error('Proxy error:', error);
-    res.status(502).json({ 
-      error: 'Proxy Error', 
+    res.status(502).json({
+      error: 'Proxy Error',
       message: error.message,
       stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
     });
@@ -250,8 +248,8 @@ export default async function handler(req, res) {
 // 配置 Vercel Function
 export const config = {
   api: {
-    bodyParser: false,  // 禁用默认的 body 解析
-    responseLimit: false,  // 移除响应大小限制
+    bodyParser: false,
+    responseLimit: false,
   },
-  maxDuration: 30,  // 最大执行时间（秒）
+  maxDuration: 30,
 };
